@@ -1,0 +1,217 @@
+networks:
+  pgnet:
+    name: pgnet
+    driver: bridge
+
+volumes:
+  pgdata1:
+    driver: local
+  pgdata2:
+    driver: local
+  pgdata3:
+    driver: local
+  etcd_data1:
+    driver: local
+  etcd_data2:
+    driver: local
+  etcd_data3:
+    driver: local
+
+services:
+
+  haproxy:
+    image: haproxy:3.3.10
+    container_name: haproxy
+    hostname: haproxy
+    networks: [pgnet]
+    depends_on:
+      pgb1:
+        condition: service_healthy
+      pgb2:
+        condition: service_healthy
+      pgb3:
+        condition: service_healthy
+    ports:
+      - "5432:5432"
+      - "5433:5433"
+      - "7001:7001"
+    volumes:
+      - ./config/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    environment:
+      HAPROXY_PASSWORD: ${HAPROXY_PASSWORD}
+    deploy:
+      resources:
+        limits:
+          memory: ${HAPROXY_MEM_LIMIT}
+          cpus: '0.5'
+        reservations:
+          memory: 64M
+          cpus: '0.1'
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "haproxy", "-c", "-f", "/usr/local/etc/haproxy/haproxy.cfg"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  etcd1: &etcd
+    image: quay.io/coreos/etcd:v3.5.0
+    container_name: etcd1
+    networks: [pgnet]
+    environment: &etcd-env
+      ETCD_INITIAL_CLUSTER: ${ETCD_CLUSTER}
+      ETCD_INITIAL_CLUSTER_STATE: new
+      ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      ETCD_DATA_DIR: /etcd-data
+      ALLOW_NONE_AUTHENTICATION: "yes"
+      ETCD_NAME: etcd1
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd1:2379
+      ETCD_ADVERTISE_PEER_URLS: http://etcd1:2380
+    volumes:
+      - etcd_data1:/etcd-data
+    deploy:
+      resources:
+        limits:
+          memory: ${ETCD_MEM_LIMIT}
+          cpus: '0.5'
+        reservations:
+          memory: 128M
+          cpus: '0.1'
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  etcd2:
+    <<: *etcd
+    container_name: etcd2
+    environment:
+      <<: *etcd-env
+      ETCD_NAME: etcd2
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd2:2379
+      ETCD_ADVERTISE_PEER_URLS: http://etcd2:2380
+    volumes:
+      - etcd_data2:/etcd-data
+  etcd3:
+    <<: *etcd
+    container_name: etcd3
+    environment:
+      <<: *etcd-env
+      ETCD_NAME: etcd3
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd3:2379
+      ETCD_ADVERTISE_PEER_URLS: http://etcd3:2380
+    volumes:
+      - etcd_data3:/etcd-data
+
+  pg1: &pg
+    image: ghcr.io/zalando/spilo-16:3.3-p3
+    container_name: pg1
+    networks: [pgnet]
+    depends_on:
+      etcd1:
+        condition: service_healthy
+      etcd2:
+        condition: service_healthy
+      etcd3:
+        condition: service_healthy
+    volumes:
+      - pgdata1:/home/postgres/
+    # env from: https://github.com/zalando/spilo/blob/master/ENVIRONMENT.rst
+    environment: &pg-env
+      SCOPE: postgres-ha
+      ETCD3_HOSTS: etcd1:2379,etcd2:2379,etcd3:2379
+      RESTAPI_CONNECT_ADDRESS: pg1
+      PGUSER_SUPERUSER: ${POSTGRES_USER}
+      PGPASSWORD_SUPERUSER: ${POSTGRES_PASSWORD}
+      PGUSER_STANDBY: ${STANDBY_USER}
+      PGPASSWORD_STANDBY: ${STANDBY_PASSWORD}
+    deploy:
+      resources:
+        limits:
+          memory: ${PG_MEM_LIMIT}
+          cpus: '1.0'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+  
+  pg2: 
+    <<: *pg
+    container_name: pg2
+    volumes:
+      - pgdata2:/var/lib/postgresql/data
+    environment: 
+      <<: *pg-env
+      RESTAPI_CONNECT_ADDRESS: pg2
+
+  pg3: 
+    <<: *pg
+    container_name: pg3
+    volumes:
+      - pgdata3:/var/lib/postgresql/data
+    environment: 
+      <<: *pg-env
+      RESTAPI_CONNECT_ADDRESS: pg3
+  
+  pgb1: &pgb
+    image: edoburu/pgbouncer:v1.25.1-p0
+    container_name: pgb1
+    networks: [pgnet]
+    depends_on:
+      pg1:
+        condition: service_healthy
+    environment: &pgb-env
+      DB_USER: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_HOST: pg1
+      DB_PORT: 5432
+      AUTH_TYPE: scram-sha-256
+      POOL_MODE: transaction
+      ADMIN_USERS: ${POSTGRES_USER}
+      MAX_CLIENT_CONN: 1000
+      DEFAULT_POOL_SIZE: 20
+      MIN_POOL_SIZE: 3
+      RESERVE_POOL_SIZE: 3
+    healthcheck:
+      test: ['CMD', 'pg_isready', '-h', 'localhost']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: 0.5
+          memory: ${PGBOUNCER_MEM_LIMIT}
+        reservations:
+          cpus: 0.1
+          memory: 64M
+  
+  pgb2:
+    <<: *pgb
+    container_name: pgb2
+    depends_on:
+      pg2:
+        condition: service_healthy
+    environment:
+      <<: *pgb-env
+      DB_HOST: pg2
+  
+  pgb3:
+    <<: *pgb
+    container_name: pgb3
+    depends_on:
+      pg3:
+        condition: service_healthy
+    environment:
+      <<: *pgb-env
+      DB_HOST: pg3
